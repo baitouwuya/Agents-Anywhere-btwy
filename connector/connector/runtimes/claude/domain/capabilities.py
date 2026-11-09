@@ -7,6 +7,7 @@ from connector.runtime_protocol import (
     CAPABILITY_CATALOG_MODEL,
     CAPABILITY_CATALOG_PERMISSION,
     CAPABILITY_RUNTIME_ATTACHMENT,
+    CAPABILITY_SESSION_COMMANDS,
     CAPABILITY_SESSION_INTERACTION_APPROVAL,
     CAPABILITY_SESSION_INTERRUPT,
     CAPABILITY_SESSION_SEND_MESSAGE,
@@ -54,6 +55,7 @@ def claude_runtime_capabilities(
                 ("interruptTurn", CAPABILITY_SESSION_INTERRUPT),
                 ("interactions", CAPABILITY_SESSION_INTERACTION_APPROVAL),
                 ("attachments", CAPABILITY_RUNTIME_ATTACHMENT),
+                ("commands", CAPABILITY_SESSION_COMMANDS),
             )
             for supported in (capabilities.get(inventory_key) is True,)
         ),
@@ -93,6 +95,23 @@ def claude_session_capabilities(
                 supported=True,
                 available=active,
                 unavailable_reason=None if active else "no_active_turn",
+                metadata={"source": "claude.runtime"},
+            ),
+            RuntimeCapability(
+                capability_id=CAPABILITY_SESSION_COMMANDS,
+                scope="session",
+                runtime="claude",
+                session_id=session_id,
+                connector_id=context.connector_id,
+                supported=capabilities.get("commands") is True,
+                available=capabilities.get("commands") is True and not active,
+                unavailable_reason=(
+                    "turn_active"
+                    if active
+                    else None
+                    if capabilities.get("commands") is True
+                    else "not_implemented"
+                ),
                 metadata={"source": "claude.runtime"},
             ),
             RuntimeCapability(

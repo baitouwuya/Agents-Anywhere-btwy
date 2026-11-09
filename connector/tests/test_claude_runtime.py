@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import stat
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -5697,3 +5698,213 @@ async def _wait_until(predicate: Any) -> None:
             return
         await asyncio.sleep(0)
     assert predicate()
+
+
+class _CatalogClaudeClient(_FakeClaudeClient):
+    """Fake SDK client that advertises a Claude Code command catalog."""
+
+    def __init__(
+        self,
+        messages: list[Any] | None = None,
+        commands: list[dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(messages)
+        self.commands = list(commands or [])
+
+    async def get_server_info(self) -> dict[str, Any]:
+        return {"commands": self.commands}
+
+    async def query(self, prompt: Any) -> None:
+        # Retained connections submit a user-message generator instead of text.
+        if isinstance(prompt, str):
+            self.queries.append(prompt)
+            return
+        async for chunk in prompt:
+            content = chunk.get("message", {}).get("content")
+            if isinstance(content, str):
+                self.queries.append(content)
+
+
+def test_claude_command_catalog_merges_cli_and_project_commands(
+    tmp_path: Path,
+) -> None:
+    from connector.runtimes.claude.domain.commands import ClaudeCommandCatalog
+
+    commands_dir = tmp_path / ".claude" / "commands"
+    (commands_dir / "nested").mkdir(parents=True)
+    (commands_dir / "hello.md").write_text(
+        "---\ndescription: project hello\n---\n\nbody\n",
+        encoding="utf-8",
+    )
+    (commands_dir / "nested" / "deep.md").write_text("deep task\n", encoding="utf-8")
+
+    catalog = ClaudeCommandCatalog(home=tmp_path / "home")
+    catalog.record_server_info(
+        str(tmp_path),
+        {
+            "commands": [
+                {
+                    "name": "compact",
+                    "description": "Free up context",
+                    "argumentHint": "<instructions>",
+                    "builtin": True,
+                },
+                {"name": "hello", "description": "cli hello (project)"},
+            ]
+        },
+    )
+
+    commands = {
+        command.id: command for command in catalog.catalog(cwd=str(tmp_path), limit=50)
+    }
+
+    # The CLI entry wins over the on-disk duplicate and keeps its custom category.
+    assert commands["hello"].description == "cli hello (project)"
+    assert commands["hello"].category == "custom"
+    assert commands["hello"].accepts_args is True
+    assert commands["nested:deep"].description == "deep task"
+    assert commands["nested:deep"].metadata["source"] == "project"
+    assert commands["compact"].accepts_args is True
+    assert catalog.find(cwd=str(tmp_path), name="/nested:deep") is not None
+    assert [command.id for command in catalog.catalog(cwd=str(tmp_path), query="deep")] == [
+        "nested:deep"
+    ]
+
+
+def test_claude_command_catalog_falls_back_to_builtins(tmp_path: Path) -> None:
+    from connector.runtimes.claude.domain.commands import ClaudeCommandCatalog
+
+    catalog = ClaudeCommandCatalog(home=tmp_path / "home")
+    ids = {command.id for command in catalog.catalog(cwd=str(tmp_path))}
+
+    assert {"compact", "clear", "context", "usage"} <= ids
+    assert catalog.find(cwd=str(tmp_path), name="reset").id == "clear"
+    assert catalog.find(cwd=str(tmp_path), name="missing") is None
+
+
+def test_claude_command_catalog_expires_advertised_commands(tmp_path: Path) -> None:
+    from connector.runtimes.claude.domain.commands import ClaudeCommandCatalog
+
+    catalog = ClaudeCommandCatalog(ttl_seconds=0.01, home=tmp_path / "home")
+    catalog.record_server_info(str(tmp_path), {"commands": [{"name": "deploy"}]})
+
+    assert "deploy" in {command.id for command in catalog.catalog(cwd=str(tmp_path))}
+    time.sleep(0.05)
+    assert "deploy" not in {
+        command.id for command in catalog.catalog(cwd=str(tmp_path))
+    }
+
+
+def test_claude_runtime_lists_and_executes_slash_commands() -> None:
+    asyncio.run(_test_claude_runtime_lists_and_executes_slash_commands())
+
+
+async def _test_claude_runtime_lists_and_executes_slash_commands() -> None:
+    host = _RecordingHost()
+    client = _CatalogClaudeClient(
+        messages=[
+            SimpleNamespace(
+                type="assistant",
+                uuid="assistant_commands",
+                session_id="claude_commands",
+                message={
+                    "id": "msg_commands",
+                    "model": "claude-sonnet-5",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "command done"}],
+                },
+            ),
+            SimpleNamespace(type="result", session_id="claude_commands"),
+        ],
+        commands=[
+            {
+                "name": "compact",
+                "description": "Free up context",
+                "argumentHint": "<instructions>",
+                "builtin": True,
+            },
+            {"name": "deploy", "description": "Ship it"},
+        ],
+    )
+    runtime = _runtime(host=host, client=client)
+
+    created = await runtime.create_and_start_session(
+        "sess_commands", "hello", cwd="/repo"
+    )
+    assert created.ok is True
+    first_task = runtime._sessions["sess_commands"].active_task
+    assert first_task is not None
+    await first_task
+
+    commands = {
+        command.id: command for command in await runtime.list_commands("sess_commands")
+    }
+    assert commands["deploy"].description == "Ship it"
+    assert commands["deploy"].accepts_args is True
+    assert commands["compact"].accepts_args is True
+
+    executed = await runtime.execute_command(
+        "sess_commands", "deploy", raw="/deploy prod"
+    )
+    assert executed.ok is True
+    turn_task = runtime._sessions["sess_commands"].active_task
+    assert turn_task is not None
+    await turn_task
+    # The raw slash text is what Claude Code needs to expand the command.
+    assert client.queries[-1] == "/deploy prod"
+
+    rebuilt = await runtime.execute_command("sess_commands", "deploy", args=("prod",))
+    assert rebuilt.ok is True
+    rebuilt_task = runtime._sessions["sess_commands"].active_task
+    assert rebuilt_task is not None
+    await rebuilt_task
+    assert client.queries[-1] == "/deploy prod"
+
+    unknown = await runtime.execute_command("sess_commands", "nope")
+    assert unknown.ok is False
+    assert unknown.code == "unknown_command"
+
+
+def test_claude_runtime_records_cli_command_catalog_from_connection() -> None:
+    asyncio.run(_test_claude_runtime_records_cli_command_catalog_from_connection())
+
+
+async def _test_claude_runtime_records_cli_command_catalog_from_connection() -> None:
+    host = _RecordingHost()
+    client = _CatalogClaudeClient(
+        messages=[
+            SimpleNamespace(
+                type="assistant",
+                uuid="assistant_catalog",
+                session_id="claude_catalog",
+                message={
+                    "id": "msg_catalog",
+                    "model": "claude-sonnet-5",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "catalog"}],
+                },
+            ),
+            SimpleNamespace(type="result", session_id="claude_catalog"),
+        ],
+        commands=[{"name": "deep-research", "description": "Research harness"}],
+    )
+    runtime = _runtime(host=host, client=client)
+
+    assert "deep-research" not in {
+        command.id for command in await runtime.list_commands("sess_catalog")
+    }
+
+    created = await runtime.create_and_start_session(
+        "sess_catalog", "hello", cwd="/repo"
+    )
+    assert created.ok is True
+    task = runtime._sessions["sess_catalog"].active_task
+    assert task is not None
+    await task
+
+    commands = {
+        command.id: command for command in await runtime.list_commands("sess_catalog")
+    }
+    assert "deep-research" in commands
+    assert commands["deep-research"].category == "custom"
+    assert commands["deep-research"].accepts_args is True

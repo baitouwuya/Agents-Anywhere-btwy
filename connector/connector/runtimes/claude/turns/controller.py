@@ -12,6 +12,7 @@ from connector.runtime_protocol import (
 )
 from connector.runtime_protocol.host import RuntimeHostClient
 from connector.runtimes.claude.catalogs.reader import ClaudeCatalogReader
+from connector.runtimes.claude.domain.commands import ClaudeCommandCatalog
 from connector.runtimes.claude.domain.pending_messages import (
     ClaudePendingClientMessageRegistry,
 )
@@ -46,6 +47,7 @@ class ClaudeTurnController:
     pending_messages: ClaudePendingClientMessageRegistry
     sdk_loader: SdkLoader | None = None
     client_factory: ClaudeClientFactory | None = None
+    command_catalog: ClaudeCommandCatalog | None = None
     interactions: ClaudeInteractionController = field(init=False)
     selections: ClaudeSelectionController = field(init=False)
     runner: ClaudeTurnRunner = field(init=False)
@@ -76,6 +78,7 @@ class ClaudeTurnController:
             catalogs=self.catalogs,
             sdk_loader=self.sdk_loader,
             client_factory=self.client_factory,
+            command_catalog=self.command_catalog,
         )
         self.actions = ClaudeTurnActionHandler(
             session_states=self.session_states,

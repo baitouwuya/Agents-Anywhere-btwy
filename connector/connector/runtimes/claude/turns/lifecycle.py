@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 from connector.logging import logger
 from connector.runtime_protocol import (
@@ -12,6 +14,7 @@ from connector.runtime_protocol import (
 )
 from connector.runtime_protocol.host import RuntimeHostClient
 from connector.runtimes.claude.catalogs.reader import ClaudeCatalogReader
+from connector.runtimes.claude.domain.commands import ClaudeCommandCatalog
 from connector.runtimes.claude.domain.pending_messages import (
     ClaudePendingClientMessageRegistry,
     client_message_text_matches,
@@ -75,12 +78,22 @@ class ClaudeTurnRunner:
     catalogs: ClaudeCatalogReader
     sdk_loader: SdkLoader | None = None
     client_factory: ClaudeClientFactory | None = None
+    command_catalog: ClaudeCommandCatalog | None = None
     connections: dict[str, ClaudeConnection] = field(default_factory=dict, init=False)
     stopping: bool = False
     scheduled_sessions: ClaudeScheduledSessions = field(init=False)
 
     def __post_init__(self) -> None:
         self.scheduled_sessions = ClaudeScheduledSessions(self.host)
+
+    def _server_info_recorder(
+        self,
+        session: ClaudeSession,
+    ) -> Callable[[Any], None] | None:
+        catalog = self.command_catalog
+        if catalog is None:
+            return None
+        return lambda info: catalog.record_server_info(session.cwd, info)
 
     async def stop(self) -> None:
         self.stopping = True
@@ -289,6 +302,7 @@ class ClaudeTurnRunner:
             ),
             cleanup=cleanup,
             idle_timeout_seconds=self.config.values.get("idleTimeoutSeconds", 600),
+            on_server_info=self._server_info_recorder(session),
             selections=dict(session.selections),
             task_ids=set(existing.task_ids) if existing is not None else set(),
         )

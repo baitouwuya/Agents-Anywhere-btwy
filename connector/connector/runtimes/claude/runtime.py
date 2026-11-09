@@ -10,6 +10,8 @@ from connector.runtime_protocol import (
     PreparedSessionTimelineSync,
     RuntimeAttachment,
     RuntimeCapabilitySet,
+    RuntimeCommand,
+    RuntimeCommandResult,
     RuntimeConfig,
     RuntimeIdentity,
     RuntimeModelCatalog,
@@ -29,6 +31,7 @@ from connector.runtimes.claude.domain.capabilities import (
     claude_runtime_capabilities,
     claude_session_capabilities,
 )
+from connector.runtimes.claude.domain.commands import ClaudeCommandCatalog
 from connector.runtimes.claude.domain.pending_messages import (
     ClaudePendingClientMessageRegistry,
 )
@@ -69,6 +72,7 @@ class ClaudeRuntime(AgentRuntime):
     _timeline: ClaudeMessageProjector = field(init=False)
     _notices: ClaudeNoticeRegistry = field(init=False)
     _notifications: ClaudeNotificationProjector = field(init=False)
+    _commands: ClaudeCommandCatalog = field(init=False)
     _turns: ClaudeTurnController = field(init=False)
 
     def __post_init__(self) -> None:
@@ -116,6 +120,7 @@ class ClaudeRuntime(AgentRuntime):
             session_store=self._session_store,
             notices=self._notices,
         )
+        self._commands = ClaudeCommandCatalog()
         self._turns = ClaudeTurnController(
             config=self.config,
             host=self.host,
@@ -130,6 +135,7 @@ class ClaudeRuntime(AgentRuntime):
             pending_messages=self._pending_messages,
             sdk_loader=self.sdk_loader,
             client_factory=self.client_factory,
+            command_catalog=self._commands,
         )
 
     @property
@@ -372,6 +378,103 @@ class ClaudeRuntime(AgentRuntime):
                 result={**result.result, "interrupted": result.ok},
             )
         return result
+
+    async def list_commands(
+        self,
+        session_id: str,
+        external_session_id: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+    ) -> tuple[RuntimeCommand, ...]:
+        cwd = await self._command_cwd(session_id, external_session_id)
+        return self._commands.catalog(cwd=cwd, query=query, limit=limit)
+
+    async def list_runtime_commands(
+        self,
+        limit: int = 100,
+    ) -> tuple[RuntimeCommand, ...]:
+        return self._commands.catalog(cwd=None, limit=limit)
+
+    async def execute_command(
+        self,
+        session_id: str,
+        command: str,
+        external_session_id: str | None = None,
+        raw: str | None = None,
+        args: tuple[str, ...] = (),
+    ) -> RuntimeCommandResult:
+        """Run a Claude Code slash command by feeding the raw text as a turn.
+
+        Claude Code expands slash commands from the input stream, so forwarding
+        ``/command args`` keeps built-ins, skills and custom commands identical to
+        the interactive CLI.
+        """
+
+        command_id = command.strip().lstrip("/")
+        if not command_id:
+            return RuntimeCommandResult(
+                command=command,
+                ok=False,
+                code="invalid_command",
+                message="command is required",
+            )
+        cwd = await self._command_cwd(session_id, external_session_id)
+        known = self._commands.find(cwd=cwd, name=command_id)
+        if known is None:
+            return RuntimeCommandResult(
+                command=command_id,
+                ok=False,
+                code="unknown_command",
+                message=f"Claude Code does not provide /{command_id}",
+            )
+        if not known.enabled:
+            return RuntimeCommandResult(
+                command=command_id,
+                ok=False,
+                code="command_disabled",
+                message=known.disabled_reason or f"/{command_id} is unavailable",
+            )
+        text = raw.strip() if isinstance(raw, str) and raw.strip() else None
+        if text is None:
+            text = f"/{command_id}"
+            if args:
+                text = f"{text} {' '.join(args)}"
+        result = await self.start_turn(
+            session_id=session_id,
+            external_session_id=external_session_id,
+            content=text,
+            cwd=cwd,
+        )
+        if not result.ok:
+            return RuntimeCommandResult(
+                command=command_id,
+                ok=False,
+                code=result.code,
+                message=result.message,
+                result=dict(result.result),
+            )
+        return RuntimeCommandResult(
+            command=command_id,
+            ok=True,
+            result=dict(result.result),
+        )
+
+    async def _command_cwd(
+        self,
+        session_id: str,
+        external_session_id: str | None,
+    ) -> str | None:
+        session = self._session_store.get(session_id, external_session_id)
+        if session is not None and session.cwd:
+            return session.cwd
+        try:
+            state = await self.get_session_state(session_id, external_session_id)
+        except Exception:  # noqa: BLE001
+            return None
+        if state is None:
+            return None
+        cwd = state.metadata.get("cwd") if state.metadata else None
+        return cwd if isinstance(cwd, str) and cwd else None
 
     async def respond_interaction(
         self,

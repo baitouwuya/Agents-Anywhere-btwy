@@ -13,6 +13,7 @@ from connector.runtimes.claude.sdk.client import (
     connect_client,
     disconnect_client,
     interrupt_client,
+    maybe_await,
     query_client,
     receive_response_messages,
 )
@@ -108,6 +109,7 @@ class ClaudeConnection:
     on_idle: Callable[[ClaudeConnection], Awaitable[None]]
     on_background_done: Callable[[ClaudeConnection], Awaitable[None]]
     cleanup: Callable[[], None]
+    on_server_info: Callable[[Any], None] | None = None
     idle_timeout_seconds: float = 600.0
     task: asyncio.Task[None] | None = None
     idle_task: asyncio.Task[None] | None = None
@@ -270,10 +272,31 @@ class ClaudeConnection:
         if self.failure is not None:
             raise self.failure
 
+    async def _record_server_info(self) -> None:
+        """Hand the CLI command catalog (slash commands, skills) to the runtime."""
+
+        if self.on_server_info is None:
+            return
+        get_server_info = getattr(self.client, "get_server_info", None)
+        if not callable(get_server_info):
+            return
+        try:
+            info = await asyncio.wait_for(maybe_await(get_server_info()), timeout=5)
+        except Exception:  # noqa: BLE001
+            logger.debug("Claude runtime could not read the CLI command catalog")
+            return
+        if info is None:
+            return
+        try:
+            self.on_server_info(info)
+        except Exception:  # noqa: BLE001
+            logger.warning("Claude runtime could not record the CLI command catalog")
+
     async def _run(self) -> None:
         try:
             await connect_client(self.client)
             self.ready.set()
+            await self._record_server_info()
             await self.queried.wait()
             preamble = []
             async for message in receive_response_messages(self.client):

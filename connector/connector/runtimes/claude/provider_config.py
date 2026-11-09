@@ -83,7 +83,7 @@ def claude_capabilities() -> dict[str, bool]:
         "startTurn": True,
         "steerTurn": False,
         "interruptTurn": True,
-        "commands": False,
+        "commands": True,
         "interactions": True,
         "attachments": True,
         "ipc": False,
